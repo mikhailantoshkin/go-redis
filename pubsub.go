@@ -37,7 +37,8 @@ type PubSub struct {
 
 	chOnce sync.Once
 	msgCh  *channel
-	allCh  *channel
+	subCh  *channel
+	invCh  *channel
 }
 
 func (c *PubSub) init() {
@@ -364,6 +365,26 @@ func (p *Pong) String() string {
 	return "Pong"
 }
 
+// Invalidation message issued on a key change when subscribed to __redis__:invalidate
+type Invalidate struct {
+	Channel      string
+	Pattern      string
+	PayloadSlice []string
+}
+
+func (m *Invalidate) String() string {
+	return fmt.Sprintf("Invalidate<%s: %s>", m.Channel, m.PayloadSlice)
+}
+
+// Invalidation message issued on full replica resync when subscribed to __redis__:invalidate
+type Resync struct {
+	Channel string
+}
+
+func (m *Resync) String() string {
+	return fmt.Sprintf("Resync<%s> ", m.Channel)
+}
+
 func (c *PubSub) newMessage(reply interface{}) (interface{}, error) {
 	switch reply := reply.(type) {
 	case string:
@@ -408,6 +429,19 @@ func (c *PubSub) newMessage(reply interface{}) (interface{}, error) {
 		case "pong":
 			return &Pong{
 				Payload: reply[1].(string),
+			}, nil
+		case "invalidate":
+			if reply[1] == nil {
+				return &Resync{Channel: reply[0].(string)}, nil
+			}
+			payload := reply[1].([]interface{})
+			ss := make([]string, len(payload))
+			for i, s := range payload {
+				ss[i] = s.(string)
+			}
+			return &Invalidate{
+				Channel:      reply[0].(string),
+				PayloadSlice: ss,
 			}, nil
 		default:
 			return nil, fmt.Errorf("redis: unsupported pubsub message: %q", kind)
@@ -469,6 +503,8 @@ func (c *PubSub) ReceiveMessage(ctx context.Context) (*Message, error) {
 			// Ignore.
 		case *Message:
 			return msg, nil
+		case *Invalidate, *Resync:
+			// Ignore
 		default:
 			err := fmt.Errorf("redis: unknown message: %T", msg)
 			return nil, err
@@ -519,14 +555,30 @@ func (c *PubSub) ChannelSize(size int) <-chan *Message {
 // ChannelWithSubscriptions can not be used together with Channel or ChannelSize.
 func (c *PubSub) ChannelWithSubscriptions(opts ...ChannelOption) <-chan interface{} {
 	c.chOnce.Do(func() {
-		c.allCh = newChannel(c, opts...)
-		c.allCh.initAllChan()
+		c.subCh = newChannel(c, opts...)
+		c.subCh.initSubChan()
 	})
-	if c.allCh == nil {
+	if c.subCh == nil {
 		err := fmt.Errorf("redis: ChannelWithSubscriptions can't be called after Channel")
 		panic(err)
 	}
-	return c.allCh.allCh
+	return c.subCh.subCh
+}
+
+// InvalidationChannel is like Channel, but message type can be either
+// *Invalidate or *Resync.
+//
+// InvalidationChannel can not be used together with any other Channel or ChannelSize.
+func (c *PubSub) InvalidationChannel(opts ...ChannelOption) <-chan interface{} {
+	c.chOnce.Do(func() {
+		c.invCh = newChannel(c, opts...)
+		c.invCh.initInvalidationChan()
+	})
+	if c.invCh == nil {
+		err := fmt.Errorf("redis: ChannelWithSubscriptions can't be called after Channel")
+		panic(err)
+	}
+	return c.invCh.invCh
 }
 
 type ChannelOption func(c *channel)
@@ -565,7 +617,8 @@ type channel struct {
 	pubSub *PubSub
 
 	msgCh chan *Message
-	allCh chan interface{}
+	subCh chan interface{}
+	invCh chan interface{}
 	ping  chan struct{}
 
 	chanSize        int
@@ -667,6 +720,8 @@ func (c *channel) initMsgChan() {
 						ctx, "redis: %s channel is full for %s (message is dropped)",
 						c, c.chanSendTimeout)
 				}
+			case *Invalidate, *Resync:
+				// Ignore.
 			default:
 				internal.Logger.Printf(ctx, "redis: unknown message type: %T", msg)
 			}
@@ -674,10 +729,10 @@ func (c *channel) initMsgChan() {
 	}()
 }
 
-// initAllChan must be in sync with initMsgChan.
-func (c *channel) initAllChan() {
+// initSubChan must be in sync with initMsgChan.
+func (c *channel) initSubChan() {
 	ctx := context.TODO()
-	c.allCh = make(chan interface{}, c.chanSize)
+	c.subCh = make(chan interface{}, c.chanSize)
 
 	go func() {
 		timer := time.NewTimer(time.Minute)
@@ -688,7 +743,7 @@ func (c *channel) initAllChan() {
 			msg, err := c.pubSub.Receive(ctx)
 			if err != nil {
 				if err == pool.ErrClosed {
-					close(c.allCh)
+					close(c.subCh)
 					return
 				}
 				if errCount > 0 {
@@ -708,11 +763,69 @@ func (c *channel) initAllChan() {
 
 			switch msg := msg.(type) {
 			case *Pong:
-				// Ignore.
+				// Ignore
 			case *Subscription, *Message:
 				timer.Reset(c.chanSendTimeout)
 				select {
-				case c.allCh <- msg:
+				case c.subCh <- msg:
+					if !timer.Stop() {
+						<-timer.C
+					}
+				case <-timer.C:
+					internal.Logger.Printf(
+						ctx, "redis: %s channel is full for %s (message is dropped)",
+						c, c.chanSendTimeout)
+				}
+			case *Invalidate, *Resync:
+				// Ignore.
+			default:
+				internal.Logger.Printf(ctx, "redis: unknown message type: %T", msg)
+			}
+		}
+	}()
+}
+
+// initSubChan must be in sync with initMsgChan.
+func (c *channel) initInvalidationChan() {
+	ctx := context.TODO()
+	c.invCh = make(chan interface{}, c.chanSize)
+
+	go func() {
+		timer := time.NewTimer(time.Minute)
+		timer.Stop()
+
+		var errCount int
+		for {
+			msg, err := c.pubSub.Receive(ctx)
+			if err != nil {
+				if err == pool.ErrClosed {
+					close(c.invCh)
+					return
+				}
+				if errCount > 0 {
+					time.Sleep(100 * time.Millisecond)
+				}
+				errCount++
+				continue
+			}
+
+			errCount = 0
+
+			// Any message is as good as a ping.
+			select {
+			case c.ping <- struct{}{}:
+			default:
+			}
+
+			switch msg := msg.(type) {
+			case *Pong:
+				//
+			case *Message, *Subscription:
+				// Ignore.
+			case *Invalidate, *Resync:
+				timer.Reset(c.chanSendTimeout)
+				select {
+				case c.invCh <- msg:
 					if !timer.Stop() {
 						<-timer.C
 					}
